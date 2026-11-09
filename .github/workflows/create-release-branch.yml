@@ -1,0 +1,86 @@
+name: create-release-branch
+
+on:
+  workflow_call:
+    inputs:
+      major:
+        description: Major version to maintain, e.g. "3"
+        required: true
+        type: string
+    secrets:
+      APP_ID:
+        required: false
+      APP_PRIVATE_KEY:
+        required: false
+
+permissions:
+  contents: write
+
+jobs:
+  create-release-branch:
+    runs-on: ubuntu-latest
+    env:
+      # Without the release App (e.g. a personal sandbox) fall back to GITHUB_TOKEN.
+      HAS_APP: ${{ secrets.APP_ID != '' }}
+    steps:
+      - name: Validate input
+        shell: bash
+        env:
+          MAJOR: ${{ inputs.major }}
+        run: |
+          if [[ ! "$MAJOR" =~ ^[0-9]+$ ]]; then
+            echo "::error::major must contain digits only."
+            exit 1
+          fi
+
+      # The GitHub App needs Contents + Workflows write (this pushes a change to release.yml).
+      - name: Generate App Token
+        id: app-token
+        if: ${{ env.HAS_APP == 'true' }}
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          fetch-depth: 0
+          token: ${{ steps.app-token.outputs.token || github.token }}
+
+      - name: Create maintenance branch
+        shell: bash
+        env:
+          MAJOR: ${{ inputs.major }}
+        run: |
+          set -euo pipefail
+          branch="release/v${MAJOR}"
+          tag="$(git tag -l "v${MAJOR}.*" | { grep -E "^v${MAJOR}\.[0-9]+\.[0-9]+$" || true; } | sort -V | tail -n 1)"
+
+          if [[ -z "$tag" ]]; then
+            echo "::error::No stable tag found for major ${MAJOR}."
+            exit 1
+          fi
+          if [[ -n "$(git ls-remote --heads origin "refs/heads/${branch}")" ]]; then
+            echo "::error::Branch ${branch} already exists."
+            exit 1
+          fi
+
+          git switch -c "$branch" "$tag"
+
+          jq -n '{
+            "$schema": "https://raw.githubusercontent.com/googleapis/release-please/main/schemas/config.json",
+            "release-type": "go",
+            "versioning": "always-bump-patch",
+            "include-component-in-tag": false,
+            "packages": { ".": {} }
+          }' > release-please-config.json
+          jq -n --arg v "${tag#v}" '{".": $v}' > .release-please-manifest.json
+          yq -i ".on.push.branches = [\"main\", \"${branch}\"]" .github/workflows/release.yml
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898583+github-actions[bot]@users.noreply.github.com"
+          git add release-please-config.json .release-please-manifest.json .github/workflows/release.yml
+          git commit -m "chore: initialise ${branch} maintenance branch from ${tag}"
+          git push origin "HEAD:refs/heads/${branch}"

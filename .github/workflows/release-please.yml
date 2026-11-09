@@ -4,9 +4,9 @@ on:
   workflow_call:
     secrets:
       APP_ID:
-        required: true
+        required: false
       APP_PRIVATE_KEY:
-        required: true
+        required: false
   push:
     branches:
       - main
@@ -18,9 +18,13 @@ permissions:
 jobs:
   release-please:
     runs-on: ubuntu-latest
+    env:
+      # Without the release App (e.g. a personal sandbox) fall back to GITHUB_TOKEN.
+      HAS_APP: ${{ secrets.APP_ID != '' }}
     steps:
       - name: Generate App Token
         id: app-token
+        if: ${{ env.HAS_APP == 'true' }}
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
           app-id: ${{ secrets.APP_ID }}
@@ -28,7 +32,43 @@ jobs:
           owner: ${{ github.repository_owner }}
           repositories: ${{ github.event.repository.name }}
 
-      - uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
+      # main: unchanged behaviour (simple mode)
+      - name: Release Please
+        if: ${{ !startsWith(github.ref_name, 'release/') }}
+        uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
         with:
           release-type: go
-          token: ${{ steps.app-token.outputs.token }}
+          token: ${{ steps.app-token.outputs.token || github.token }}
+
+      # release/vN: manifest mode; config + manifest exist on the maintenance branch only
+      - name: Release Please (maintenance branch)
+        id: release
+        if: ${{ startsWith(github.ref_name, 'release/') }}
+        uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
+        with:
+          target-branch: ${{ github.ref_name }}
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+          token: ${{ steps.app-token.outputs.token || github.token }}
+
+      # release-please does not pass make_latest, so GitHub marks the hotfix as Latest.
+      # Put Latest back on the highest stable semver release.
+      - name: Restore Latest release
+        if: ${{ startsWith(github.ref_name, 'release/') && steps.release.outputs.release_created == 'true' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token || github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          latest="$(
+            gh release list --json tagName,isDraft,isPrerelease --limit 200 |
+              jq -r '.[] | select(.isDraft == false and .isPrerelease == false)
+                | .tagName | select(test("^v[0-9]+\\.[0-9]+\\.[0-9]+$"))' |
+              sort -V | tail -n 1
+          )"
+          if [[ -z "$latest" ]]; then
+            echo "::error::No stable semver release found."
+            exit 1
+          fi
+          gh release edit "$latest" --latest
